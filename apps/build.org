@@ -1,0 +1,287 @@
+#+TITLE: Build and run the set of applications
+
+*** Docker Compose manifests
+
+**** NATS single node + connected via links
+
+#+BEGIN_SRC yaml :tangle /ssh:ubuntu@127.0.0.1#2222:go/nats-links-single-node.yaml
+version: "2"
+
+services:
+  # Single NATS server
+  nats:
+    image: 'nats:0.8.0'
+    entrypoint: "/gnatsd"
+    expose:
+      - "4222"
+    ports:
+      - "8222:8222"
+    hostname: nats-server
+
+  # API server
+  api:
+    build:
+      context: "./src/github.com/wallyqs/nats-docker-examples/apps/api"
+    entrypoint: /go/api-server
+    links:
+      - nats
+    environment:
+      - "NATS_URI=nats://nats:4222"
+    depends_on:
+      - nats
+    ports:
+      - "8080:8080"
+
+  # Worker server
+  worker:
+    build:
+      context: "./src/github.com/wallyqs/nats-docker-examples/apps/worker"
+    entrypoint: /go/worker
+    links:
+      - nats
+    environment:
+      - "NATS_URI=nats://nats:4222"
+    depends_on:
+      - nats
+    ports:
+      - "8181:8181"
+#+END_SRC
+
+**** NATS single node + connected using network
+
+#+BEGIN_SRC yaml :tangle /ssh:ubuntu@127.0.0.1#2222:go/nats-network-single-node.yaml
+version: "2"
+
+networks:
+  nats-network: {}
+  # Cannot use overlay without setting up Docker Swarm first
+  #  driver: overlay
+
+services:
+  nats-ops:
+    image: busybox
+    command: /bin/tail -f /dev/null
+    networks: ["nats-network"]
+
+  # Single NATS server setup
+  nats-server:
+    networks: ["nats-network"]
+    image: 'nats:0.8.0'
+    entrypoint: "/gnatsd -DV"
+    ports:
+      - "8222:8222"
+
+  # API server
+  api:
+    networks: ["nats-network"]
+
+    build:
+      context: "./src/github.com/wallyqs/nats-docker-examples/apps/api"
+    entrypoint: /go/api-server
+    environment:
+      - "NATS_URI=nats://nats-server:4222"
+    depends_on:
+      - nats-server
+    ports:
+      - "8080:8080"
+
+  # Worker server
+  worker:
+    networks: ["nats-network"]
+    build:
+      context: "./src/github.com/wallyqs/nats-docker-examples/apps/worker"
+    entrypoint: /go/worker
+    environment:
+      - "NATS_URI=nats://nats-server:4222"
+    depends_on:
+      - nats-server
+
+#+END_SRC
+
+**** NATS cluster + connected using network
+
+#+BEGIN_SRC yaml :tangle /ssh:ubuntu@127.0.0.1#2222:go/nats-network-clustering.yaml
+version: "2"
+
+networks:
+  nats-network: {}
+  # Cannot use overlay without setting up Docker Swarm first
+  #  driver: overlay
+
+services:
+  nats-ops:
+    image: wallyqs/nats-ops
+    command: tail -f /dev/null
+    networks: ["nats-network"]
+
+  # NATS cluster
+  nats-server-A:
+    networks: ["nats-network"]
+    image: "nats:0.9.4"
+    entrypoint: "/gnatsd -V -m 8222 --cluster nats://0.0.0.0:6222 --routes nats://nats-server-B:6222,nats://nats-server-C:6222"
+  nats-server-B:
+    networks: ["nats-network"]
+    image: "nats:0.9.4"
+    entrypoint: "/gnatsd -V -m 8222 --cluster nats://0.0.0.0:6222 --routes nats://nats-server-A:6222,nats://nats-server-C:6222"
+  nats-server-C:
+    networks: ["nats-network"]
+    image: "nats:0.9.4"
+    entrypoint: "/gnatsd -V -m 8222 --cluster nats://0.0.0.0:6222 --routes nats://nats-server-A:6222,nats://nats-server-B:6222"
+
+  # API server
+  api:
+    networks: ["nats-network"]
+
+    build:
+      context: "./src/github.com/wallyqs/nats-docker-examples/apps/api"
+    entrypoint: /go/api-server
+    environment:
+      - "NATS_URI=nats://nats-server-A:4222"
+    depends_on:
+      - nats-server-A
+    ports:
+      - "8080:8080"
+
+  # Worker server
+  worker:
+    networks: ["nats-network"]
+    build:
+      context: "./src/github.com/wallyqs/nats-docker-examples/apps/worker"
+    entrypoint: /go/worker
+    environment:
+      - "NATS_URI=nats://nats-server-A:4222"
+    depends_on:
+      - nats-server-A
+
+#+END_SRC
+
+*** Build and smoke test
+     :properties:
+     :header-args: :dir /ssh:ubuntu@127.0.0.1#2222:go
+     :end:
+
+**** Run NATS single server setup
+
+#+BEGIN_SRC sh
+sudo docker-compose  -p demo -f nats-network-single-node.yaml up --build
+#+END_SRC
+
+**** Run NATS cluster setup
+
+#+BEGIN_SRC sh
+sudo docker-compose  -p demo -f nats-network-clustering.yaml up --build
+#+END_SRC
+
+**** Smoke test
+
+- Create a task
+
+#+BEGIN_SRC sh :results output
+while true; do 
+  curl -X POST 127.0.0.1:8080/createTask; sleep 0.1
+done
+#+END_SRC
+
+#+RESULTS:
+: Task scheduled in 1.299259ms
+: Response: Done!
+
+- Create a tasks which will be handled by a single worker at a time
+
+#+BEGIN_SRC sh :results output
+while true; do 
+  curl -X POST 127.0.0.1:8080/createWorkerTask; sleep 0.1
+done
+#+END_SRC
+
+#+RESULTS:
+: Task scheduled in 4.55891ms
+: Response: Done!
+
+***** Cluster interaction with everyone connected to A
+
+#+BEGIN_SRC 
+nats-server-C_1  | [1] 2016/10/11 19:40:15.552493 [TRC] 172.20.0.3:54456 - rid:1 - ->> [SUB _INBOX.CxFVFeY482OEONrlvfalPB  RSID:3:65]
+nats-server-C_1  | [1] 2016/10/11 19:40:15.552823 [TRC] 172.20.0.3:54456 - rid:1 - ->> [UNSUB RSID:3:65 1]
+nats-server-C_1  | [1] 2016/10/11 19:40:15.553214 [TRC] 172.20.0.3:54456 - rid:1 - ->> [UNSUB RSID:3:65]
+nats-server-C_1  | [1] 2016/10/11 19:40:15.553223 [TRC] 172.20.0.3:54456 - rid:1 - <-> [DELSUB RSID:3:65]
+nats-server-B_1  | [1] 2016/10/11 19:40:15.552465 [TRC] 172.20.0.3:55654 - rid:3 - ->> [SUB _INBOX.CxFVFeY482OEONrlvfalPB  RSID:3:65]
+nats-server-B_1  | [1] 2016/10/11 19:40:15.552669 [TRC] 172.20.0.3:55654 - rid:3 - ->> [UNSUB RSID:3:65 1]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552275 [TRC] 172.20.0.6:41128 - cid:3 - ->> [SUB _INBOX.CxFVFeY482OEONrlvfalPB  65]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552347 [TRC] 172.20.0.5:6222  - rid:1 - <<- [SUB _INBOX.CxFVFeY482OEONrlvfalPB  RSID:3:65]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552524 [TRC] 172.20.0.4:6222  - rid:6 - <<- [SUB _INBOX.CxFVFeY482OEONrlvfalPB  RSID:3:65]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552530 [TRC] 172.20.0.6:41128 - cid:3 - ->> [UNSUB 65 1]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552582 [TRC] 172.20.0.5:6222  - rid:1 - <<- [UNSUB RSID:3:65 1]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552697 [TRC] 172.20.0.4:6222  - rid:6 - <<- [UNSUB RSID:3:65 1]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552702 [TRC] 172.20.0.6:41128 - cid:3 - ->> [PUB tasks _INBOX.CxFVFeY482OEONrlvfalPB 11]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552706 [TRC] 172.20.0.6:41128 - cid:3 - ->> MSG_PAYLOAD: [help please]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.552713 [TRC] 172.20.0.7:46646 - cid:4 - <<- [MSG tasks 1 _INBOX.CxFVFeY482OEONrlvfalPB 11]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.553081 [TRC] 172.20.0.7:46646 - cid:4 - ->> [PUB _INBOX.CxFVFeY482OEONrlvfalPB 5]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.553088 [TRC] 172.20.0.7:46646 - cid:4 - ->> MSG_PAYLOAD: [Done!]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.553099 [TRC] 172.20.0.6:41128 - cid:3 - <<- [MSG _INBOX.CxFVFeY482OEONrlvfalPB 65 5]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.553103 [TRC] 172.20.0.6:41128 - cid:3 - <-> [DELSUB 65]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.553188 [TRC] 172.20.0.5:6222  - rid:1 - <<- [UNSUB RSID:3:65]
+nats-server-A_1  | [1] 2016/10/11 19:40:15.553326 [TRC] 172.20.0.4:6222  - rid:6 - <<- [UNSUB RSID:3:65]
+nats-server-B_1  | [1] 2016/10/11 19:40:15.553269 [TRC] 172.20.0.3:55654 - rid:3 - ->> [UNSUB RSID:3:65]
+nats-server-B_1  | [1] 2016/10/11 19:40:15.553291 [TRC] 172.20.0.3:55654 - rid:3 - <-> [DELSUB RSID:3:65]
+#+END_SRC
+
+***** Cluster interaction after A goes away
+
+#+BEGIN_SRC 
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458060 [TRC] 172.20.0.5:6222  - rid:2 - ->> [SUB _INBOX.CxFVFeY482OEONrlvfalTb  RSID:5:66]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458091 [TRC] 172.20.0.5:6222  - rid:2 - ->> [UNSUB RSID:5:66 1]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458099 [TRC] 172.20.0.5:6222  - rid:2 - ->> [MSG tasks RSID:6:1 _INBOX.CxFVFeY482OEONrlvfalTb 11]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.457747 [TRC] 172.20.0.6:45340 - cid:5 - ->> [SUB _INBOX.CxFVFeY482OEONrlvfalTb  66]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.457825 [TRC] 172.20.0.4:35748 - rid:3 - <<- [SUB _INBOX.CxFVFeY482OEONrlvfalTb  RSID:5:66]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.457869 [TRC] 172.20.0.6:45340 - cid:5 - ->> [UNSUB 66 1]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.457893 [TRC] 172.20.0.4:35748 - rid:3 - <<- [UNSUB RSID:5:66 1]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.457899 [TRC] 172.20.0.6:45340 - cid:5 - ->> [PUB tasks _INBOX.CxFVFeY482OEONrlvfalTb 11]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.457902 [TRC] 172.20.0.6:45340 - cid:5 - ->> MSG_PAYLOAD: [help please]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.457911 [TRC] 172.20.0.4:35748 - rid:3 - <<- [MSG tasks RSID:6:1 _INBOX.CxFVFeY482OEONrlvfalTb 11]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.458467 [TRC] 172.20.0.4:35748 - rid:3 - ->> [MSG _INBOX.CxFVFeY482OEONrlvfalTb RSID:5:66 5]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.458483 [TRC] 172.20.0.4:35748 - rid:3 - ->> MSG_PAYLOAD: [Done!]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.458494 [TRC] 172.20.0.6:45340 - cid:5 - <<- [MSG _INBOX.CxFVFeY482OEONrlvfalTb 66 5]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.458499 [TRC] 172.20.0.6:45340 - cid:5 - <-> [DELSUB 66]
+nats-server-C_1  | [1] 2016/10/11 19:47:28.458520 [TRC] 172.20.0.4:35748 - rid:3 - <<- [UNSUB RSID:5:66]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458124 [TRC] 172.20.0.5:6222  - rid:2 - ->> MSG_PAYLOAD: [help please]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458146 [TRC] 172.20.0.7:57314 - cid:6 - <<- [MSG tasks 1 _INBOX.CxFVFeY482OEONrlvfalTb 11]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458340 [TRC] 172.20.0.7:57314 - cid:6 - ->> [PUB _INBOX.CxFVFeY482OEONrlvfalTb 5]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458358 [TRC] 172.20.0.7:57314 - cid:6 - ->> MSG_PAYLOAD: [Done!]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458368 [TRC] 172.20.0.5:6222  - rid:2 - <<- [MSG _INBOX.CxFVFeY482OEONrlvfalTb RSID:5:66 5]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458373 [TRC] 172.20.0.5:6222  - rid:2 - <-> [DELSUB RSID:5:66]
+nats-server-B_1  | [1] 2016/10/11 19:47:28.458586 [TRC] 172.20.0.5:6222  - rid:2 - ->> [UNSUB RSID:5:66]
+#+END_SRC
+
+***** Full wildcard subscription on server B
+
+#+BEGIN_SRC 
+nats-server-A_1  | [1] 2016/10/11 20:41:34.951713 [TRC] 172.20.0.4:36164 - rid:2 - ->> [SUB >  RSID:8:90]
+nats-server-B_1  | [1] 2016/10/11 20:41:34.950871 [TRC] 172.20.0.3:49270 - cid:8 - ->> [SUB > 90]
+nats-server-C_1  | [1] 2016/10/11 20:41:34.951407 [TRC] 172.20.0.4:6222 - rid:1 - ->> [SUB >  RSID:8:90]
+nats-server-B_1  | [1] 2016/10/11 20:41:34.950924 [TRC] 172.20.0.3:49270 - cid:8 - <<- [OK]
+nats-server-B_1  | [1] 2016/10/11 20:41:34.951016 [TRC] 172.20.0.2:33558 - rid:1 - <<- [SUB >  RSID:8:90]
+nats-server-B_1  | [1] 2016/10/11 20:41:34.951067 [TRC] 172.20.0.5:6222 - rid:3 - <<- [SUB >  RSID:8:90]
+#+END_SRC
+
+***** Reconnection
+
+Fallback into another node and replay all the subscription commands
+
+#+BEGIN_SRC 
+nats-server-B_1  | [1] 2016/10/11 20:43:31.854769 [TRC] 172.20.0.2:33558 - rid:1 - ->> [SUB tasks  RSID:6:1]
+worker_1         | Got disconnected!
+nats-server-B_1  | [1] 2016/10/11 20:43:31.856692 [TRC] 172.20.0.2:33558 - rid:1 - ->> [SUB workers tasks QRSID:6:2]
+worker_5         | Got reconnected to nats://172.20.0.2:4222!
+api_1            | Got reconnected to nats://172.20.0.4:4222!
+worker_4         | Got reconnected to nats://172.20.0.2:4222!
+nats-server-C_1  | [1] 2016/10/11 20:43:31.866006 [TRC] 172.20.0.11:43458 - cid:5 - ->> [SUB workers tasks 2]
+worker_2         | Got reconnected to nats://172.20.0.2:4222!
+worker_1         | Got reconnected to nats://172.20.0.2:4222!
+nats-server-C_1  | [1] 2016/10/11 20:43:31.866119 [TRC] 172.20.0.4:6222 - rid:1 - <<- [SUB workers tasks QRSID:5:2]
+nats-server-C_1  | [1] 2016/10/11 20:43:31.866125 [TRC] 172.20.0.11:43458 - cid:5 - ->> [SUB tasks  1]
+nats-server-C_1  | [1] 2016/10/11 20:43:31.866146 [TRC] 172.20.0.4:6222 - rid:1 - <<- [SUB tasks  RSID:5:1]
+nats-server-C_1  | [1] 2016/10/11 20:43:31.866159 [TRC] 172.20.0.11:43458 - cid:5 - ->> [PING]
+nats-server-C_1  | [1] 2016/10/11 20:43:31.866162 [TRC] 172.20.0.11:43458 - cid:5 - <<- [PONG]
+nats-server-C_1  | [1] 2016/10/11 20:43:31.868295 [TRC] 172.20.0.7:49334 - cid:8 - ->> [CONNECT {"verbose":false,"pedantic":false,"tls_required":false,"name":"worker","lang":"go","version":"1.2.2","protocol":1}]
+#+END_SRC

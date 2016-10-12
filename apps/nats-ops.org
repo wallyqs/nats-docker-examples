@@ -1,0 +1,38 @@
+# -*- mode: org; mode: auto-fill -*-
+#+TITLE:    NATS tools
+#+STARTUP:  showeverything
+
+*** =wallyqs/nats-ops=
+
+- Includes
+  + nats-sub
+  + nats-pub
+  + nats-top
+
+**** =Dockerfile=
+
+#+BEGIN_SRC sh :mkdirp true :tangle /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/ops/Dockerfile
+FROM golang:1.7.1
+
+ENV GOBIN /go/bin/
+ENV TERM xterm
+
+RUN apt-get update && apt-get install -y dnsutils && apt-get install -y telnet
+
+RUN go get github.com/nats-io/nats && go get github.com/nats-io/nats-top
+
+RUN   go install /go/src/github.com/nats-io/nats/examples/nats-bench.go \
+   && go install /go/src/github.com/nats-io/nats/examples/nats-pub.go   \
+   && go install /go/src/github.com/nats-io/nats/examples/nats-sub.go   \
+   && go install /go/src/github.com/nats-io/nats/examples/nats-qsub.go  \
+   && go install /go/src/github.com/nats-io/nats/examples/nats-req.go   \
+   && go install /go/src/github.com/nats-io/nats/examples/nats-rply.go  \
+   && go install /go/src/github.com/nats-io/nats/examples/nats-bench.go
+
+#+END_SRC
+
+**** Build
+
+#+BEGIN_SRC sh :dir /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/ops/
+sudo docker build -t wallyqs/nats-ops .
+#+END_SRC

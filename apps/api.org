@@ -1,0 +1,122 @@
+#+TITLE: API server
+
+*** =walllyqs/sample-nats-api-server=
+
+**** Dockerfile
+
+#+BEGIN_SRC sh :mkdirp true :tangle /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/api/Dockerfile
+FROM golang:1.7.1
+
+COPY . /go
+
+RUN go get github.com/nats-io/nats
+RUN go build api-server.go
+
+EXPOSE 8080
+ENTRYPOINT ["/go/api-server"]
+#+END_SRC
+
+**** Build
+
+#+BEGIN_SRC sh :dir /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/api/
+sudo docker build -t wallyqs/sample-nats-api-server .
+#+END_SRC
+
+*** API Server
+
+Sample NATS server worker implementation
+
+#+BEGIN_SRC go :mkdirp true :tangle /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/api/api-server.go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/nats-io/nats"
+)
+
+const (
+	DEFAULT_TASKS_SUBJECT         = "tasks"
+	DEFAULT_WORKERS_QUEUE_SUBJECT = "workers"
+)
+
+type server struct {
+	nc *nats.Conn
+}
+
+func (s server) baseRoot(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "Basic NATS based microservice example v0.1.0")
+}
+
+func (s server) createTask(w http.ResponseWriter, r *http.Request) {
+	deadline := 5 * time.Second
+	requestAt := time.Now()
+	response, err := s.nc.Request(DEFAULT_TASKS_SUBJECT, []byte("help please"), deadline)
+	if err != nil {
+		log.Println("Error making NATS request:", err)
+		fmt.Fprintf(w, "Gave up waiting for response after %+v: %v\n", deadline, err)
+		return
+	}
+	duration := time.Since(requestAt)
+
+	fmt.Fprintf(w, "Task scheduled in %+v\nResponse: %v\n", duration, string(response.Data))
+}
+
+func (s server) createWorkerTask(w http.ResponseWriter, r *http.Request) {
+	deadline := 5 * time.Second
+	requestAt := time.Now()
+	response, err := s.nc.Request(DEFAULT_WORKERS_QUEUE_SUBJECT, []byte("help please"), deadline)
+	if err != nil {
+		log.Println("Error making NATS request:", err)
+		fmt.Fprintf(w, "Gave up waiting for response after %+v: %v\n", deadline, err)
+		return
+	}
+	duration := time.Since(requestAt)
+
+	fmt.Fprintf(w, "Task scheduled in %+v\nResponse: %v\n", duration, string(response.Data))
+}
+
+func (s server) healthz(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "OK")
+}
+
+func main() {
+	var s server
+	var err error
+	uri := os.Getenv("NATS_URI")
+
+	nc, err := nats.Connect(uri,
+		nats.Name("api-server"),
+		nats.DisconnectHandler(func(nc *nats.Conn) {
+			fmt.Printf("Got disconnected!\n")
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			fmt.Printf("Got reconnected to %v!\n", nc.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			fmt.Printf("Connection closed. Reason: %q\n", nc.LastError())
+		}),
+		// Never stop reconnecting...
+		nats.MaxReconnects(0),
+	)
+	if err != nil {
+		log.Fatal("Error establishing connection to NATS:", err)
+	}
+	s.nc = nc
+
+	fmt.Println("Connected to NATS at:", s.nc.ConnectedUrl())
+	http.HandleFunc("/", s.baseRoot)
+	http.HandleFunc("/createTask", s.createTask)
+	http.HandleFunc("/createWorkerTask", s.createWorkerTask)
+	http.HandleFunc("/healthz", s.healthz)
+
+	fmt.Println("Server listening on port 8080...")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
+	}
+}
+#+END_SRC

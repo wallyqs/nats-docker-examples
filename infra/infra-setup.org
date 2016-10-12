@@ -1,0 +1,1017 @@
+#+TITLE:      Simple and Scalable Microservices: NATS and the Docker tooling
+#+property:   header-args :results output :exports both
+
+** Provisioning
+
+*** Goal
+
+- 5 VMs in Google Compute Engine
+
+#+BEGIN_SRC sh :results output code :exports both
+gcloud compute instances list
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+NAME            ZONE           MACHINE_TYPE   PREEMPTIBLE  INTERNAL_IP  EXTERNAL_IP      STATUS
+docker-swarm-0  us-central1-a  n1-standard-1               10.240.0.10  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-1  us-central1-a  n1-standard-1               10.240.0.11  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-2  us-central1-a  n1-standard-1               10.240.0.12  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-3  us-central1-a  n1-standard-1               10.240.0.13  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-4  us-central1-a  n1-standard-1               10.240.0.14  AAA.BBB.CCC.DDD  RUNNING
+#+END_SRC
+
+*** Set region to use
+
+#+BEGIN_SRC sh
+gcloud config set compute/region us-central1
+gcloud config set compute/zone   us-central1-a
+#+END_SRC
+
+*** Create a custom network
+
+#+BEGIN_SRC sh
+gcloud compute networks create nats-docker --mode custom
+#+END_SRC
+
+#+RESULTS:
+: NAME         MODE    IPV4_RANGE  GATEWAY_IPV4
+: nats-docker  custom
+
+*** Create subnet
+
+#+BEGIN_SRC sh
+gcloud compute networks subnets create nats-docker \
+  --network nats-docker \
+  --range 10.240.0.0/24
+#+END_SRC
+
+#+RESULTS:
+: NAME         REGION       NETWORK      RANGE
+: nats-docker  us-central1  nats-docker  10.240.0.0/24
+
+*** Firewalls
+
+- Allow ping from anywhere
+
+#+BEGIN_SRC sh
+gcloud compute firewall-rules create nats-docker-allow-icmp \
+  --allow icmp \
+  --network nats-docker \
+  --source-ranges 0.0.0.0/0 
+#+END_SRC
+
+#+RESULTS:
+: NAME                    NETWORK      SRC_RANGES  RULES  SRC_TAGS  TARGET_TAGS
+: nats-docker-allow-icmp  nats-docker  0.0.0.0/0   icmp
+
+- Allow internal traffic
+
+#+BEGIN_SRC sh
+gcloud compute firewall-rules create nats-docker-allow-internal \
+  --allow tcp:0-65535,udp:0-65535,icmp \
+  --network nats-docker \
+  --source-ranges 10.240.0.0/24
+#+END_SRC
+
+#+RESULTS:
+: NAME                        NETWORK      SRC_RANGES     RULES                         SRC_TAGS  TARGET_TAGS
+: nats-docker-allow-internal  nats-docker  10.240.0.0/24  tcp:0-65535,udp:0-65535,icmp
+
+- Allow ssh from anywhere
+
+#+BEGIN_SRC sh
+gcloud compute firewall-rules create nats-docker-allow-ssh \
+  --allow tcp:22 \
+  --network nats-docker \
+  --source-ranges 0.0.0.0/0
+#+END_SRC
+
+#+RESULTS:
+: NAME                   NETWORK      SRC_RANGES  RULES   SRC_TAGS  TARGET_TAGS
+: nats-docker-allow-ssh  nats-docker  0.0.0.0/0   tcp:22
+
+- Allow public ip health check monitoring
+
+#+BEGIN_SRC sh
+gcloud compute firewall-rules create nats-docker-allow-healthz \
+  --allow tcp:8080 \
+  --network nats-docker \
+  --source-ranges 130.211.0.0/22
+#+END_SRC
+
+#+RESULTS:
+: NAME                       NETWORK      SRC_RANGES      RULES     SRC_TAGS  TARGET_TAGS
+: nats-docker-allow-healthz  nats-docker  130.211.0.0/22  tcp:8080
+
+- Allow API server
+
+#+BEGIN_SRC sh
+gcloud compute firewall-rules create nats-docker-allow-api-server \
+  --allow tcp:80 \
+  --network nats-docker \
+  --source-ranges 0.0.0.0/0
+#+END_SRC
+
+- NATS Docker network
+
+#+BEGIN_SRC sh
+gcloud compute firewall-rules list --filter "network=nats-docker"
+#+END_SRC
+
+#+RESULTS:
+: NAME                        NETWORK      SRC_RANGES      RULES                         SRC_TAGS  TARGET_TAGS
+: nats-docker-allow-healthz   nats-docker  130.211.0.0/22  tcp:8080
+: nats-docker-allow-icmp      nats-docker  0.0.0.0/0       icmp
+: nats-docker-allow-internal  nats-docker  10.240.0.0/24   tcp:0-65535,udp:0-65535,icmp
+: nats-docker-allow-ssh       nats-docker  0.0.0.0/0       tcp:22
+
+*** Public IP Address
+
+#+BEGIN_SRC sh
+gcloud compute addresses create nats-docker --region us-central1
+#+END_SRC
+
+Confirm
+
+#+BEGIN_SRC sh
+gcloud compute addresses list nats-docker
+#+END_SRC
+
+#+RESULTS:
+: NAME         REGION       ADDRESS          STATUS
+: nats-docker  us-central1  AAA.BBB.CCC.DDD  RESERVED
+
+*** Infrastructure
+
+| NAME           | ROLE(S)  |          IP |
+| docker-swarm-0 | leader   | 10.240.0.10 |
+| docker-swarm-1 | follower | 10.240.0.11 |
+| docker-swarm-2 | follower | 10.240.0.12 |
+| docker-swarm-3 | follower | 10.240.0.13 |
+| docker-swarm-4 | follower | 10.240.0.14 |
+
+***** Creating the nodes
+
+#+BEGIN_SRC sh :results output code
+for i in `seq 0 4`; do
+  gcloud compute instances create docker-swarm-$i \
+   --boot-disk-size 200GB \
+   --can-ip-forward \
+   --image ubuntu-1604-xenial-v20160627 \
+   --image-project ubuntu-os-cloud \
+   --machine-type n1-standard-1 \
+   --private-network-ip 10.240.0.1$i \
+   --zone us-central1-a \
+   --subnet nats-docker
+done
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+gcloud compute instances create docker-swarm-0    --boot-disk-size 200GB    --can-ip-forward    --image ubuntu-1604-xenial-v20160627    --image-project ubuntu-os-cloud    --machine-type n1-standard-1    --private-network-ip 10.240.0.10    --zone us-central1-a    --subnet nats-docker
+gcloud compute instances create docker-swarm-1    --boot-disk-size 200GB    --can-ip-forward    --image ubuntu-1604-xenial-v20160627    --image-project ubuntu-os-cloud    --machine-type n1-standard-1    --private-network-ip 10.240.0.11    --zone us-central1-a    --subnet nats-docker
+gcloud compute instances create docker-swarm-2    --boot-disk-size 200GB    --can-ip-forward    --image ubuntu-1604-xenial-v20160627    --image-project ubuntu-os-cloud    --machine-type n1-standard-1    --private-network-ip 10.240.0.12    --zone us-central1-a    --subnet nats-docker
+gcloud compute instances create docker-swarm-3    --boot-disk-size 200GB    --can-ip-forward    --image ubuntu-1604-xenial-v20160627    --image-project ubuntu-os-cloud    --machine-type n1-standard-1    --private-network-ip 10.240.0.13    --zone us-central1-a    --subnet nats-docker
+gcloud compute instances create docker-swarm-4    --boot-disk-size 200GB    --can-ip-forward    --image ubuntu-1604-xenial-v20160627    --image-project ubuntu-os-cloud    --machine-type n1-standard-1    --private-network-ip 10.240.0.14    --zone us-central1-a    --subnet nats-docker
+#+END_SRC
+
+Confirm
+
+#+BEGIN_SRC sh :results output code
+gcloud compute instances list
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+NAME            ZONE           MACHINE_TYPE   PREEMPTIBLE  INTERNAL_IP  EXTERNAL_IP      STATUS
+docker-swarm-0  us-central1-a  n1-standard-1               10.240.0.10  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-1  us-central1-a  n1-standard-1               10.240.0.11  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-2  us-central1-a  n1-standard-1               10.240.0.12  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-3  us-central1-a  n1-standard-1               10.240.0.13  AAA.BBB.CCC.DDD  RUNNING
+docker-swarm-4  us-central1-a  n1-standard-1               10.240.0.14  AAA.BBB.CCC.DDD  RUNNING
+#+END_SRC
+
+** Installing Docker in all the nodes
+
+*** Emacs
+
+#+BEGIN_SRC emacs-lisp
+(setq cluster-domain ".us-central1-a.YOUR_PROJECT_NAME_HERE")
+
+(defun docker:infra-ssh(node &optional path)
+  (or path (setq path ""))
+  (message (concat "/ssh:" node cluster-domain ":" path)))
+#+END_SRC
+
+*** Node 0
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-0") :results silent
+    :end:
+
+**** Installing Docker
+
+#+BEGIN_SRC sh
+curl -O -L https://get.docker.com/builds/Linux/x86_64/docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh :results silent
+tar -xvf docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo cp docker/docker* /usr/bin/
+#+END_SRC
+
+**** Setting up Docker systemd service
+
+#+BEGIN_SRC conf :tangle (docker:infra-ssh "docker-swarm-0" "/tmp/docker.service")
+[Unit]
+Description=Docker Application Container Engine
+Documentation=http://docs.docker.io
+
+[Service]
+ExecStart=/usr/bin/docker daemon \
+  --iptables=false \
+  --ip-masq=false \
+  --host=unix:///var/run/docker.sock \
+  --host=tcp://127.0.0.1:2375 \
+  --log-level=error \
+  --storage-driver=overlay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+#+END_SRC
+
+#+name: docker-swarm-0-systemd-configure
+#+BEGIN_SRC sh
+sudo cp /tmp/docker.service /etc/systemd/system/docker.service
+#+END_SRC
+
+#+name: docker-swarm-0-systemd-reload
+#+BEGIN_SRC sh 
+sudo systemctl daemon-reload
+sudo systemctl enable docker
+sudo systemctl start docker
+#+END_SRC
+
+**** Confirm
+
+#+BEGIN_SRC sh :results output code
+sudo docker ps
+#+END_SRC
+
+*** Node 1
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-1") :results silent
+    :end:
+
+**** Installing Docker
+
+#+BEGIN_SRC sh
+curl -O -L https://get.docker.com/builds/Linux/x86_64/docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh
+tar -xvf docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo cp docker/docker* /usr/bin/
+#+END_SRC
+
+**** Setting up Docker systemd service
+
+#+BEGIN_SRC conf :tangle (docker:infra-ssh "docker-swarm-1" "/tmp/docker.service")
+[Unit]
+Description=Docker Application Container Engine
+Documentation=http://docs.docker.io
+
+[Service]
+ExecStart=/usr/bin/docker daemon \
+  --iptables=false \
+  --ip-masq=false \
+  --host=unix:///var/run/docker.sock \
+  --host=tcp://127.0.0.1:2375 \
+  --log-level=error \
+  --storage-driver=overlay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+#+END_SRC
+
+#+name: docker-swarm-1-systemd-configure
+#+BEGIN_SRC sh
+sudo cp /tmp/docker.service /etc/systemd/system/docker.service
+#+END_SRC
+
+#+name: docker-swarm-1-systemd-reload
+#+BEGIN_SRC sh 
+sudo systemctl daemon-reload
+sudo systemctl enable docker
+sudo systemctl start docker
+#+END_SRC
+
+**** Confirm
+
+#+BEGIN_SRC sh :results output code
+sudo docker ps
+#+END_SRC
+
+*** Node 2
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-2") :results silent
+    :end:
+
+**** Installing Docker
+
+#+BEGIN_SRC sh
+curl -O -L https://get.docker.com/builds/Linux/x86_64/docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh
+tar -xvf docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo cp docker/docker* /usr/bin/
+#+END_SRC
+
+**** Setting up Docker systemd service
+
+#+BEGIN_SRC conf :tangle (docker:infra-ssh "docker-swarm-2" "/tmp/docker.service")
+[Unit]
+Description=Docker Application Container Engine
+Documentation=http://docs.docker.io
+
+[Service]
+ExecStart=/usr/bin/docker daemon \
+  --iptables=false \
+  --ip-masq=false \
+  --host=unix:///var/run/docker.sock \
+  --host=tcp://127.0.0.1:2375 \
+  --log-level=error \
+  --storage-driver=overlay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+#+END_SRC
+
+#+name: docker-swarm-2-systemd-configure
+#+BEGIN_SRC sh
+sudo cp /tmp/docker.service /etc/systemd/system/docker.service
+#+END_SRC
+
+#+name: docker-swarm-2-systemd-reload
+#+BEGIN_SRC sh 
+sudo systemctl daemon-reload
+sudo systemctl enable docker
+sudo systemctl start docker
+#+END_SRC
+
+**** Confirm
+
+#+BEGIN_SRC sh :results output code
+sudo docker ps
+#+END_SRC
+
+*** Node 3
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-3") :results silent
+    :end:
+
+**** Installing Docker
+
+#+BEGIN_SRC sh
+curl -O -L https://get.docker.com/builds/Linux/x86_64/docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh :results silent
+tar -xvf docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo cp docker/docker* /usr/bin/
+#+END_SRC
+
+**** Setting up Docker systemd service
+
+#+BEGIN_SRC conf :tangle (docker:infra-ssh "docker-swarm-3" "/tmp/docker.service")
+[Unit]
+Description=Docker Application Container Engine
+Documentation=http://docs.docker.io
+
+[Service]
+ExecStart=/usr/bin/docker daemon \
+  --iptables=false \
+  --ip-masq=false \
+  --host=unix:///var/run/docker.sock \
+  --host=tcp://127.0.0.1:2375 \
+  --log-level=error \
+  --storage-driver=overlay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+#+END_SRC
+
+#+name: docker-swarm-3-systemd-configure
+#+BEGIN_SRC sh
+sudo cp /tmp/docker.service /etc/systemd/system/docker.service
+#+END_SRC
+
+#+name: docker-swarm-3-systemd-reload
+#+BEGIN_SRC sh 
+sudo systemctl daemon-reload
+sudo systemctl enable docker
+sudo systemctl start docker
+#+END_SRC
+
+**** Confirm
+
+#+BEGIN_SRC sh :results output code
+sudo docker ps
+#+END_SRC
+
+*** Node 4
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-4") :results silent
+    :end:
+
+**** Installing Docker
+
+#+BEGIN_SRC sh
+curl -O -L https://get.docker.com/builds/Linux/x86_64/docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh :results silent
+tar -xvf docker-1.12.1.tgz
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo cp docker/docker* /usr/bin/
+#+END_SRC
+
+**** Setting up Docker systemd service
+
+#+BEGIN_SRC conf :tangle (docker:infra-ssh "docker-swarm-4" "/tmp/docker.service")
+[Unit]
+Description=Docker Application Container Engine
+Documentation=http://docs.docker.io
+
+[Service]
+ExecStart=/usr/bin/docker daemon \
+  --iptables=false \
+  --ip-masq=false \
+  --host=unix:///var/run/docker.sock \
+  --host=tcp://127.0.0.1:2375 \
+  --log-level=error \
+  --storage-driver=overlay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+#+END_SRC
+
+#+name: docker-swarm-systemd-configure
+#+BEGIN_SRC sh
+sudo cp /tmp/docker.service /etc/systemd/system/docker.service
+#+END_SRC
+
+#+BEGIN_SRC sh 
+sudo systemctl daemon-reload
+sudo systemctl enable docker
+sudo systemctl start docker
+#+END_SRC
+
+When updating we need to restart:
+
+#+name: docker-swarm-systemd-reload
+#+BEGIN_SRC sh 
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+#+END_SRC
+
+
+**** Confirm
+
+#+BEGIN_SRC sh :results output code
+sudo docker ps
+#+END_SRC
+
+*** COMMENT Update all nodes
+
+#+call: docker-swarm-systemd-configure[:dir (docker:infra-ssh "docker-swarm-0")]() :results silent
+#+call: docker-swarm-systemd-reload[   :dir (docker:infra-ssh "docker-swarm-0")]() :results silent
+
+#+call: docker-swarm-systemd-configure[:dir (docker:infra-ssh "docker-swarm-1")]() :results silent
+#+call: docker-swarm-systemd-reload[   :dir (docker:infra-ssh "docker-swarm-1")]() :results silent
+
+#+call: docker-swarm-systemd-configure[:dir (docker:infra-ssh "docker-swarm-2")]() :results silent
+#+call: docker-swarm-systemd-reload[   :dir (docker:infra-ssh "docker-swarm-2")]() :results silent
+
+#+call: docker-swarm-systemd-configure[:dir (docker:infra-ssh "docker-swarm-3")]() :results silent
+#+call: docker-swarm-systemd-reload[   :dir (docker:infra-ssh "docker-swarm-3")]() :results silent
+
+#+call: docker-swarm-systemd-configure[:dir (docker:infra-ssh "docker-swarm-4")]() :results silent
+#+call: docker-swarm-systemd-reload[   :dir (docker:infra-ssh "docker-swarm-4")]() :results silent
+
+** Docker Swarm mode setup
+
+*** COMMENT Docs
+
+https://docs.docker.com/engine/reference/commandline/swarm_init/
+
+*** Node 0
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-0") :results output
+    :end:
+
+#+BEGIN_SRC sh :exports both
+sudo docker swarm init --advertise-addr 10.240.0.10
+#+END_SRC
+
+#+RESULTS:
+#+begin_example
+Swarm initialized: current node (93cb4tot9jvcvn3o2u60fntlz) is now a manager.
+
+To add a worker to this swarm, run the following command:
+
+    docker swarm join \
+    --token SWMTKN-1-3dp2fr5m5ycz9daobryhi4kzv82ol3skahy7oqdyczgmjbj0ru-7ltk8rkyei28lz7d07l0fajjr \
+    10.240.0.10:2377
+
+To add a manager to this swarm, run 'docker swarm join-token manager' and follow the instructions.
+
+#+end_example
+
+*** Node 1
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-1") :results output
+    :end:
+
+#+BEGIN_SRC sh
+sudo docker swarm join \
+--token SWMTKN-1-3dp2fr5m5ycz9daobryhi4kzv82ol3skahy7oqdyczgmjbj0ru-7ltk8rkyei28lz7d07l0fajjr \
+10.240.0.10:2377
+#+END_SRC
+
+#+RESULTS:
+: This node joined a swarm as a worker.
+
+*** Node 2
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-2") :results output
+    :end:
+
+#+BEGIN_SRC sh
+sudo docker swarm join \
+--token SWMTKN-1-3dp2fr5m5ycz9daobryhi4kzv82ol3skahy7oqdyczgmjbj0ru-7ltk8rkyei28lz7d07l0fajjr \
+10.240.0.10:2377
+#+END_SRC
+
+#+RESULTS:
+: This node joined a swarm as a worker.
+
+*** Node 3
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-3") :results output
+    :end:
+
+#+BEGIN_SRC sh
+sudo docker swarm join \
+--token SWMTKN-1-3dp2fr5m5ycz9daobryhi4kzv82ol3skahy7oqdyczgmjbj0ru-7ltk8rkyei28lz7d07l0fajjr \
+10.240.0.10:2377
+#+END_SRC
+
+#+RESULTS:
+: This node joined a swarm as a worker.
+
+*** Node 4
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-4") :results output
+    :end:
+
+#+BEGIN_SRC sh
+sudo docker swarm join \
+--token SWMTKN-1-3dp2fr5m5ycz9daobryhi4kzv82ol3skahy7oqdyczgmjbj0ru-7ltk8rkyei28lz7d07l0fajjr \
+10.240.0.10:2377
+#+END_SRC
+
+#+RESULTS:
+: This node joined a swarm as a worker.
+
+** Confirm Docker Swarm cluster
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-0") :results output code
+    :end:
+
+#+BEGIN_SRC sh :exports both 
+sudo docker node ls
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+ID                           HOSTNAME        STATUS  AVAILABILITY  MANAGER STATUS
+16bvu8ecwg38gwxe15gqnic2c    docker-swarm-2  Ready   Active        
+2p73mixe2doka3wj55away1nh    docker-swarm-4  Ready   Active        
+93cb4tot9jvcvn3o2u60fntlz *  docker-swarm-0  Ready   Active        Leader
+dobqk55qesnbdzdfod12pl07e    docker-swarm-1  Ready   Active        
+ef6lbguddbexk61x5ntm73th5    docker-swarm-3  Ready   Active        
+#+END_SRC
+
+** Prepare nats-cluster-network and smoke test
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-0") :results output code
+    :end:
+
+**** Create the nats-cluster network and service
+
+#+BEGIN_SRC sh
+sudo docker network create --driver overlay nats-cluster-example
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+                             --name nats-cluster-node-1 nats:0.9.4 -DV -cluster nats://0.0.0.0:6222
+
+# Update
+# sudo docker service update --args "-DV -cluster nats://0.0.0.0:6222" nats-cluster-node-1
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+505vquxp3y9cglij8bz2dsrap
+#+END_SRC
+
+**** Confirm
+
+#+BEGIN_SRC sh 
+sudo docker ps
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+CONTAINER ID        IMAGE               COMMAND                  CREATED             STATUS              PORTS                          NAMES
+9cccf623bc1b        nats:0.9.4          "/gnatsd -c /gnatsd.c"   46 seconds ago      Up 45 seconds       4222/tcp, 6222/tcp, 8222/tcp   nats-cluster-node-1.1.90ugss9jbm9jdfqplc6p07bmj
+#+END_SRC
+
+**** Create sample ruby-nats service
+
+#+BEGIN_SRC sh
+sudo docker service create --name ruby-nats --network nats-cluster-example wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0 -e '
+  NATS.on_error do |e|
+    puts "ERROR: #{e}"
+  end
+  NATS.start(:servers => ["nats://nats-cluster-node-1:4222"]) do |nc|
+    inbox = NATS.create_inbox
+    puts "[#{Time.now}] Connected to NATS at #{nc.connected_server}, inbox: #{inbox}"
+
+    nc.subscribe(inbox) do |msg, reply|
+      puts "[#{Time.now}] Received reply - #{msg}"
+    end
+
+    nc.subscribe("hello") do |msg, reply|
+      next if reply == inbox
+      puts "[#{Time.now}] Received greeting - #{msg} - #{reply}"
+      nc.publish(reply, "world")
+    end
+
+    EM.add_periodic_timer(1) do
+      puts "[#{Time.now}] Saying hi (servers in pool: #{nc.server_pool}"
+      nc.publish("hello", "hi", inbox)
+    end
+  end
+'
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+5m2u2jp20cnl9tf1ntc6t1rhj
+#+END_SRC
+
+**** Inspect running services
+
+#+BEGIN_SRC sh
+sudo docker service ls
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+ID            NAME                 REPLICAS  IMAGE                                     COMMAND
+1qu447mo0fqe  nats-cluster-node-1  1/1       nats:0.9.4                                -DV
+5m2u2jp20cnl  ruby-nats            1/1       wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  -e 
+  NATS.on_error do |e|
+    puts "ERROR: #{e}"
+  end
+  NATS.start(:servers => ["nats://nats-cluster-node-1:4222"]) do |nc|
+    inbox = NATS.create_inbox
+    puts "[#{Time.now}] Connected to NATS at #{nc.connected_server}, inbox: #{inbox}"
+
+    nc.subscribe(inbox) do |msg, reply|
+      puts "[#{Time.now}] Received reply - #{msg}"
+    end
+
+    nc.subscribe("hello") do |msg, reply|
+      next if reply == inbox
+      puts "[#{Time.now}] Received greeting - #{msg} - #{reply}"
+      nc.publish(reply, "world")
+    end
+
+    EM.add_periodic_timer(1) do
+      puts "[#{Time.now}] Saying hi (servers in pool: #{nc.server_pool}"
+      nc.publish("hello", "hi", inbox)
+    end
+  end
+
+#+END_SRC
+
+**** Increase number of ruby-nats services
+
+#+BEGIN_SRC sh
+sudo docker service scale ruby-nats=5
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+ruby-nats scaled to 5
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo docker service ls
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+ID            NAME                 REPLICAS  IMAGE                                     COMMAND
+1qu447mo0fqe  nats-cluster-node-1  1/1       nats:0.9.4                                -DV
+5m2u2jp20cnl  ruby-nats            1/5       wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  -e 
+  NATS.on_error do |e|
+    puts "ERROR: #{e}"
+  end
+  NATS.start(:servers => ["nats://nats-cluster-node-1:4222"]) do |nc|
+    inbox = NATS.create_inbox
+    puts "[#{Time.now}] Connected to NATS at #{nc.connected_server}, inbox: #{inbox}"
+
+    nc.subscribe(inbox) do |msg, reply|
+      puts "[#{Time.now}] Received reply - #{msg}"
+    end
+
+    nc.subscribe("hello") do |msg, reply|
+      next if reply == inbox
+      puts "[#{Time.now}] Received greeting - #{msg} - #{reply}"
+      nc.publish(reply, "world")
+    end
+
+    EM.add_periodic_timer(1) do
+      puts "[#{Time.now}] Saying hi (servers in pool: #{nc.server_pool}"
+      nc.publish("hello", "hi", inbox)
+    end
+  end
+
+#+END_SRC
+
+#+BEGIN_SRC sh :exports both
+echo "--- NODES"
+for i in `seq 0 4`; do
+  echo
+  echo "● docker-swarm-$i"
+  sudo docker node ps docker-swarm-$i
+done
+echo
+echo "--- SERVICES"
+sudo docker service ls
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+--- NODES
+
+● docker-swarm-0
+ID                         NAME                   IMAGE                    NODE            DESIRED STATE  CURRENT STATE              ERROR
+5oq8kh059me3yra5gnc86mwws  nats-ops.1             wallyqs/nats-ops:latest  docker-swarm-0  Running        Running 10 minutes ago     
+90ugss9jbm9jdfqplc6p07bmj  nats-cluster-node-1.1  nats:0.9.4               docker-swarm-0  Running        Running about an hour ago  
+
+● docker-swarm-1
+ID                         NAME         IMAGE                                     NODE            DESIRED STATE  CURRENT STATE           ERROR
+9u4r6yp85spj85jvt7s8x6qmd  ruby-nats.2  wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  docker-swarm-1  Running        Running 21 minutes ago  
+
+● docker-swarm-2
+ID                         NAME         IMAGE                                     NODE            DESIRED STATE  CURRENT STATE              ERROR
+f3a08hc0hz9y61zolz6r3mibk  ruby-nats.1  wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  docker-swarm-2  Running        Running about an hour ago  
+
+● docker-swarm-3
+ID                         NAME         IMAGE                                     NODE            DESIRED STATE  CURRENT STATE           ERROR
+erkiytraly8atxqy03vvxqy0z  ruby-nats.4  wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  docker-swarm-3  Running        Running 21 minutes ago  
+13fmolsohdvh39juysb580pk8  ruby-nats.5  wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  docker-swarm-3  Running        Running 21 minutes ago  
+
+● docker-swarm-4
+ID                         NAME         IMAGE                                     NODE            DESIRED STATE  CURRENT STATE           ERROR
+02037tsgeyst9qqclbnn1urld  ruby-nats.3  wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  docker-swarm-4  Running        Running 21 minutes ago  
+
+--- SERVICES
+ID            NAME                 REPLICAS  IMAGE                                     COMMAND
+1qu447mo0fqe  nats-cluster-node-1  1/1       nats:0.9.4                                -DV
+35g5krwa8q7v  nats-ops             1/1       wallyqs/nats-ops:latest                   tail -f /dev/null
+5m2u2jp20cnl  ruby-nats            5/5       wallyqs/ruby-nats:ruby-2.3.1-nats-v0.8.0  -e 
+  NATS.on_error do |e|
+    puts "ERROR: #{e}"
+  end
+  NATS.start(:servers => ["nats://nats-cluster-node-1:4222"]) do |nc|
+    inbox = NATS.create_inbox
+    puts "[#{Time.now}] Connected to NATS at #{nc.connected_server}, inbox: #{inbox}"
+
+    nc.subscribe(inbox) do |msg, reply|
+      puts "[#{Time.now}] Received reply - #{msg}"
+    end
+
+    nc.subscribe("hello") do |msg, reply|
+      next if reply == inbox
+      puts "[#{Time.now}] Received greeting - #{msg} - #{reply}"
+      nc.publish(reply, "world")
+    end
+
+    EM.add_periodic_timer(1) do
+      puts "[#{Time.now}] Saying hi (servers in pool: #{nc.server_pool}"
+      nc.publish("hello", "hi", inbox)
+    end
+  end
+
+#+END_SRC
+
+**** Create nats-ops container and NATS nodes
+
+- Ops server for monitoring within the =nats-cluster-example= network
+
+#+BEGIN_SRC sh
+# sudo docker run --network nats-cluster-example wallyqs/nats-ops:latest /bin/bash
+sudo docker service create --network nats-cluster-example \
+                             --name nats-ops wallyqs/nats-ops:latest tail -f /dev/null
+#+END_SRC
+
+- Add a new NATS cluster node which will be discovered dynamically
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+               --name nats-cluster-node-2 nats:0.9.4 -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+e9y9dc9nkavvbby3httmtuu61
+#+END_SRC
+
+- Add another NATS cluster node
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+               --name nats-cluster-node-3 nats:0.9.4 -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222,nats://nats-cluster-node-2:6222
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+b7ac8do12rruxfbwrnv6lxcxt
+#+END_SRC
+
+**** Scaling down the original container to rebalance
+
+To test out manual operations:
+
+#+BEGIN_SRC sh
+sudo docker service scale nats-cluster-node-1=0
+#+END_SRC
+** Run API Server and Workers onto Docker Swarm
+    :properties:
+    :header-args: :dir (docker:infra-ssh "docker-swarm-0") :results output code
+    :end:
+
+**** Create seed NATS cluster
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+              --name nats-cluster-node-1 nats:0.9.4 -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+8vyk9s9uxjkkrnu3kca9tlv12
+#+END_SRC
+
+**** Increase number of NATS nodes
+
+Subsequent NATS cluster nodes could only connect to initial node
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+              --name nats-cluster-node-2 nats:0.9.4 -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+0t25tub2t520otwjb364aogmh
+#+END_SRC
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+              --name nats-cluster-node-3 nats:0.9.4 -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+1nwismtrn7guchrj5cyj419ly
+#+END_SRC
+
+**** Run =wallyqs/nats-ops= image to inspect current status
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+             --name nats-ops wallyqs/nats-ops:latest tail -f /dev/null
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+4gi2qxyhv08socfa2wjh6wqdo
+#+END_SRC
+
+**** Confirm
+
+#+BEGIN_SRC sh 
+sudo docker node ls
+sudo docker service ls
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+ID                           HOSTNAME        STATUS  AVAILABILITY  MANAGER STATUS
+16bvu8ecwg38gwxe15gqnic2c    docker-swarm-2  Ready   Active        
+2p73mixe2doka3wj55away1nh    docker-swarm-4  Ready   Active        
+93cb4tot9jvcvn3o2u60fntlz *  docker-swarm-0  Ready   Active        Leader
+dobqk55qesnbdzdfod12pl07e    docker-swarm-1  Ready   Active        
+ef6lbguddbexk61x5ntm73th5    docker-swarm-3  Ready   Active        
+ID            NAME                 REPLICAS  IMAGE                    COMMAND
+0t25tub2t520  nats-cluster-node-2  1/1       nats:0.9.4               -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222
+1nwismtrn7gu  nats-cluster-node-3  1/1       nats:0.9.4               -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222
+4gi2qxyhv08s  nats-ops             1/1       wallyqs/nats-ops:latest  tail -f /dev/null
+8vyk9s9uxjkk  nats-cluster-node-1  1/1       nats:0.9.4               -DV -cluster nats://0.0.0.0:6222 -routes nats://nats-cluster-node-1:6222
+#+END_SRC
+
+**** Start API Server
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+             --name api-server -e NATS_URI="nats://nats-cluster-node-1:4222" wallyqs/sample-nats-api-server:latest
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+dyhrl92kn42a6o5uft3wa2z0l
+#+END_SRC
+
+**** Start single worker
+
+#+BEGIN_SRC sh
+sudo docker service create --network nats-cluster-example \
+             --name worker -e NATS_URI="nats://nats-cluster-node-1:4222" wallyqs/sample-nats-worker:latest
+#+END_SRC
+
+#+RESULTS:
+#+BEGIN_SRC sh
+an5o0227asxzcocrzge7vaz5a
+#+END_SRC
+
+**** Within nats-ops container
+
+- Make a request through NATS
+
+#+BEGIN_SRC sh
+while true; do 
+  nats-req -s nats://nats-cluster-node-1:4222 tasks help
+  sleep 0.1
+done
+#+END_SRC
+
+- Make a request through the API server
+
+#+BEGIN_SRC sh
+while true; do
+  curl -X POST http://api-server:8080/createTask; 
+  sleep 1; 
+done
+#+END_SRC
+
+- Make a request to the distribution queue
+
+#+BEGIN_SRC sh
+while true; do
+  curl -X POST http://api-server:8080/createWorkerTask; 
+  sleep 1; 
+done
+#+END_SRC

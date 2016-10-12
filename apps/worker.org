@@ -1,0 +1,119 @@
+#+TITLE: Worker
+
+*** =walllyqs/sample-nats-worker=
+
+**** Dockerfile
+
+#+BEGIN_SRC conf :mkdirp true :tangle /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/worker/Dockerfile
+FROM golang:1.7.1
+
+COPY . /go
+
+RUN go get github.com/nats-io/nats
+RUN go build worker.go
+
+EXPOSE 8080
+ENTRYPOINT ["/go/worker"]
+#+END_SRC
+
+**** Build
+
+#+BEGIN_SRC sh :dir /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/worker/
+sudo docker build -t wallyqs/sample-nats-worker .
+#+END_SRC
+
+*** Worker
+
+Sample NATS worker implementation
+
+#+BEGIN_SRC go :mkdirp true :tangle /ssh:ubuntu@127.0.0.1#2222:go/src/github.com/wallyqs/nats-docker-examples/apps/worker/worker.go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+
+	"github.com/nats-io/nats"
+)
+
+const (
+	DEFAULT_TASKS_SUBJECT         = "tasks"
+	DEFAULT_WORKERS_QUEUE_SUBJECT = "workers"
+)
+
+func healthz(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "OK")
+}
+
+func main() {
+	var tasksSubject string
+	tasksSubject = os.Getenv("TASKS_SUBJECT")
+	if len(tasksSubject) < 1 {
+		tasksSubject = DEFAULT_TASKS_SUBJECT
+	}
+	var workersSubject string
+	workersSubject = os.Getenv("WORKERS_QUEUE_SUBJECT")
+	if len(workersSubject) < 1 {
+		workersSubject = DEFAULT_WORKERS_QUEUE_SUBJECT
+	}
+
+	uri := os.Getenv("NATS_URI")
+	if len(uri) < 1 {
+		log.Fatalf("NATS_URI environment variable is required!")
+	}
+
+	// Establish connection to NATS and set the reconnect handlers
+	nc, err := nats.Connect(uri,
+		nats.Name("worker"),
+		nats.DisconnectHandler(func(nc *nats.Conn) {
+			fmt.Printf("Got disconnected!\n")
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			fmt.Printf("Got reconnected to %v!\n", nc.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			fmt.Printf("Connection closed. Reason: %q\n", nc.LastError())
+		}),
+		// Never stop reconnecting...
+		nats.MaxReconnects(0),
+	)
+	if err != nil {
+		log.Fatalf("Error establishing connection to NATS: %s", err)
+	}
+	fmt.Printf("Connected to NATS at: %v\n", nc.ConnectedUrl())
+
+	// Subscription: 'tasks'
+	_, err = nc.Subscribe(tasksSubject, func(m *nats.Msg) {
+		fmt.Printf("Got task request on: %q reply=%q\n", m.Subject, m.Reply)
+		nc.Publish(m.Reply, []byte("Done!"))
+	})
+	if err != nil {
+		log.Fatalf("Error on subscription NATS: %s", err)
+	}
+	fmt.Printf("Worker subscribed to %q for processing requests...\n", tasksSubject)
+
+	// Distribution Queue: 'workers tasks'
+	_, err = nc.QueueSubscribe(workersSubject, tasksSubject, func(m *nats.Msg) {
+		fmt.Printf("Got worker task request on: %q reply=%q\n", m.Subject, m.Reply)
+		nc.Publish(m.Reply, []byte("Done!"))
+	})
+	if err != nil {
+		log.Fatalf("Error on subscription NATS: %s", err)
+	}
+	fmt.Printf("Worker subscribed to %q for processing requests using %q distribution queue...\n", workersSubject, tasksSubject)
+
+	// Ensure that the server has processed our subscriptions
+	err = nc.Flush()
+	if err != nil {
+		log.Fatalf("Error on subscription NATS: %s", err)
+	}
+
+	fmt.Printf("Server listening on port 8080...\n")
+	http.HandleFunc("/healthz", healthz)
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
+	}
+}
+#+END_SRC
