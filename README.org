@@ -1,3 +1,14 @@
 #+title: NATS + Docker examples
 
-This repository includes a series of examples of using NATS and Docker together.
+This repository includes a series of Org mode examples of using NATS and Docker together.
+
+Material from the /Simple and Scalable Microservices: NATS and the Docker tooling/ Docker Meetup talk.
+
+- NATS + Docker Compose examples
+  + Run =vagrant up= to bring up the =vagrant= box
+  + Visit [[./dev/setup.org]] with Emacs then =M-x org-babel-tangle= or just copy snippets into =vagrant= box
+  + Follow [[./apps/build.org]] to run the examples
+
+- NATS + Docker Swarm mode examples
+  + Install =gcloud= tools for creating servers in =GCE=
+  + Follow [[./infra/infra-setup.org]] to create the environment
