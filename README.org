@@ -2,7 +2,7 @@
 
 This repository includes a series of Org mode examples of using NATS and Docker together.
 
-Material from the [[http://www.slideshare.net/wallyqs/nats-docker-meetup-talk-oct-2016][Simple and Scalable Microservices: NATS and the Docker tooling]] talk at Docker SF Meetup, Oct 2016
+Material from the [[http://www.slideshare.net/wallyqs/nats-docker-meetup-talk-oct-2016][Simple and Scalable Microservices: NATS and the Docker tooling]] talk at Docker SF Meetup, Oct 2016 ([[https://www.youtube.com/watch?v=X4m-voD3zjU][video]])
 
 - NATS + Docker Compose examples
   + Run =vagrant up= to bring up the =vagrant= box
